@@ -1,0 +1,277 @@
+import json
+import os
+import re
+import sys
+import time
+import wave
+import datetime
+import subprocess
+import threading
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+from pathlib import Path
+
+from vosk import KaldiRecognizer, Model
+
+
+class DynamicSubprocessTranscriber:
+
+    def __init__(self, root: tk.Tk):
+        self.root = root
+        self.root.title("Dynamic Subprocess Extractor")
+        self.root.geometry("750x650")
+        self.root.minsize(550, 500)
+
+        self.video_path = ""
+        self.extracted_text = ""
+        self.ffmpeg_cmd = "ffmpeg"
+        self.total_duration = 0.0
+
+        self.create_widgets()
+        self.check_os_and_adapt()
+
+    def create_widgets(self):
+        """Builds a clean, responsive Tkinter user interface with Progress tracking."""
+        # Top frame for file selection
+        file_frame = ttk.LabelFrame(self.root, text=" 1. Select Video File ", padding=10)
+        file_frame.pack(fill="x", padx=15, pady=10)
+
+        self.file_label = ttk.Label(
+            file_frame, text="No file selected", foreground="gray"
+        )
+        self.file_label.pack(side="left", fill="x", expand=True, padx=5)
+
+        browse_btn = ttk.Button(
+            file_frame, text="Browse...", command=self.select_file
+        )
+        browse_btn.pack(side="right", padx=5)
+
+        # Middle frame for control actions
+        control_frame = ttk.LabelFrame(
+            self.root, text=" 2. Actions & Progress ", padding=10
+        )
+        control_frame.pack(fill="x", padx=15, pady=5)
+
+        self.process_btn = ttk.Button(
+            control_frame,
+            text="Extract Audio & Transcribe",
+            command=self.start_processing_thread,
+            state="disabled",
+        )
+        self.process_btn.pack(side="left", padx=5)
+
+        self.export_btn = ttk.Button(
+            control_frame,
+            text="Export to .srt",
+            command=self.export_to_srt,
+            state="disabled",
+        )
+        self.export_btn.pack(side="left", padx=5)
+
+        self.status_label = ttk.Label(
+            control_frame, text="Status: Ready", font=("Helvetica", 9, "italic")
+        )
+        self.status_label.pack(side="right", padx=5)
+
+        # Dynamic Tracking Block (Progress Bar & ETA layout)
+        progress_frame = ttk.Frame(control_frame)
+        progress_frame.pack(fill="x", side="bottom", pady=(10, 0))
+
+        self.progress_bar = ttk.Progressbar(
+            progress_frame, orient="horizontal", mode="determinate"
+        )
+        self.progress_bar.pack(fill="x", side="left", expand=True, padx=(0, 10))
+
+        self.eta_label = ttk.Label(
+            progress_frame, text="ETA: --:--", font=("Helvetica", 9)
+        )
+        self.eta_label.pack(side="right")
+
+        # Bottom frame for text output
+        output_frame = ttk.LabelFrame(
+            self.root, text=" 3. Extracted SRT Subtitles ", padding=10
+        )
+        output_frame.pack(fill="both", expand=True, padx=15, pady=10)
+
+        self.text_area = tk.Text(output_frame, wrap="word")
+        self.text_area.pack(
+            side="left", fill="both", expand=True, padx=(0, 5), pady=5
+        )
+
+        scrollbar = ttk.Scrollbar(output_frame, command=self.text_area.yview)
+        scrollbar.pack(side="right", fill="y")
+        self.text_area.config(yscrollcommand=scrollbar.set)
+
+    def check_os_and_adapt(self):
+        """Dynamically detects the OS and adjusts context logs."""
+        if os.name == "nt":
+            self.status_label.config(text="Status: Windows environment. Ready.")
+        else:
+            self.status_label.config(text="Status: Unix environment. Ready.")
+
+    def get_video_duration(self, filepath: str) -> float:
+        """Queries FFmpeg/FFprobe internally to isolate exact duration for metrics matching."""
+        # Uses ffmpeg to parse metadata info safely without extra ffprobe packaging dependency
+        cmd = [self.ffmpeg_cmd, "-i", filepath]
+        startupinfo = None
+        if os.name == "nt":
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+
+        process = subprocess.run(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, startupinfo=startupinfo
+        )
+        output = process.stderr.decode("utf-8", errors="ignore")
+        
+        match = re.search(r"Duration:\s*(\d+):(\d+):(\d+)\.(\d+)", output)
+        if match:
+            hours, minutes, seconds, hundredths = map(int, match.groups())
+            return hours * 3600 + minutes * 60 + seconds + hundredths / 100.0
+        return 0.0
+
+    def select_file(self):
+        """Opens a file dialog to choose a video file and maps total length metrics."""
+        file_types = [
+            ("Video Files", "*.mp4 *.mkv *.avi *.mov *.flv"),
+            ("All Files", "*.*"),
+        ]
+        selected = filedialog.askopenfilename(filetypes=file_types)
+        if selected:
+            self.video_path = selected
+            self.file_label.config(
+                text=os.path.basename(selected), foreground="black"
+            )
+            self.total_duration = self.get_video_duration(selected)
+            self.process_btn.config(state="normal")
+            self.status_label.config(text=f"Status: Loaded video ({int(self.total_duration)}s). Ready.")
+
+    def cleanPath(self):
+        return Path(self.video_path).with_suffix("")
+
+    def extract_audio_with_progress(self, output_wav_path: str):
+        """Optimized audio extractor tracking FFmpeg time-stamps to drive increments."""
+        command = [
+            self.ffmpeg_cmd,
+            "-y",
+            "-threads", "0",
+            "-i", self.video_path,
+            "-vn",
+            "-ac", "1",
+            "-ar", "16000",
+            "-c:a", "pcm_s16le",
+            output_wav_path,
+        ]
+
+        startupinfo = None
+        if os.name == "nt":
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+
+        # Read FFmpeg's stderr stream progressively to calculate execution speed metrics
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            startupinfo=startupinfo,
+            universal_newlines=True,
+            errors="ignore"
+        )
+
+        start_time = time.time()
+        
+        while True:
+            # FFmpeg reports updates line by line via stderr loop
+            line = process.stderr.readline()
+            if not line and process.poll() is not None:
+                break
+            
+            if "time=" in line:
+                match = re.search(r"time=(\d+):(\d+):(\d+)\.(\d+)", line)
+                if match and self.total_duration > 0:
+                    hours, minutes, seconds, hundredths = map(int, match.groups())
+                    current_secs = hours * 3600 + minutes * 60 + seconds + hundredths / 100.0
+                    
+                    # Update progress bars safely via threading bounds
+                    progress_pct = min((current_secs / self.total_duration) * 100, 100)
+                    elapsed = time.time() - start_time
+                    
+                    if current_secs > 0:
+                        eta_secs = int((elapsed / current_secs) * (self.total_duration - current_secs))
+                        self.root.after(0, lambda p=progress_pct, e=eta_secs: self.update_progress("Extracting", p, e))
+
+        if process.returncode != 0:
+            raise RuntimeError("FFmpeg extraction pipeline failed.")
+
+    def injectTrainedModel(self):
+        self.MODEL_PATH = r"C:\Users\mrdan\OneDrive\Documents\python\vosk-model-en-us-0.22-lgraph"
+        if not os.path.exists(self.MODEL_PATH):
+            raise FileNotFoundError(f"Vosk model path not found at: {self.MODEL_PATH}")
+        return Model(self.MODEL_PATH)
+
+    def format_srt_timestamp(self, seconds: float) -> str:
+        """Converts raw floating seconds into strict standard SRT timestamp formatting: HH:MM:SS,mmm"""
+        hrs = int(seconds // 3600)
+        mins = int((seconds % 3600) // 60)
+        secs = int(seconds % 60)
+        millis = int((seconds - int(seconds)) * 1000)
+        return f"{hrs:02d}:{mins:02d}:{secs:02d},{millis:03d}"
+
+    def start_processing_thread(self):
+        self.process_btn.config(state="disabled")
+        self.export_btn.config(state="disabled")
+        self.text_area.delete("1.0", tk.END)
+        self.progress_bar["value"] = 0
+        self.eta_label.config(text="ETA: Calculating...")
+        threading.Thread(target=self.process_pipeline, daemon=True).start()
+
+    def process_pipeline(self):
+        audio_file = str(self.cleanPath().with_suffix(".wav"))
+        try:
+            # Phase 1: Dynamic Optimized Extraction Tracking
+            self.extract_audio_with_progress(audio_file)
+
+            # Phase 2: AI Loading Engine
+            self.root.after(0, lambda: self.status_label.config(text="Status: Booting AI Engine..."))
+            model = self.injectTrainedModel()
+
+            # Phase 3: Transcription Queue Engine tracking frame-byte indexing
+            self.root.after(0, lambda: self.status_label.config(text="Status: Transcribing Audio Stream..."))
+            wf = wave.open(audio_file, "rb")
+            
+            total_frames = wf.getnframes()
+            framerate = wf.getframerate()
+            audio_duration = total_frames / float(framerate)
+
+            recognizer = KaldiRecognizer(model, framerate)
+            recognizer.SetWords(True)
+
+            srt_blocks = []
+            block_index = 1
+            processed_frames = 0
+            transcribe_start = time.time()
+
+            while True:
+                data = wf.readframes(4000)
+                if len(data) == 0:
+                    break
+                
+                processed_frames += 4000
+                
+                # Periodically update calculation estimates based on internal frame cursor index
+if processed_frames % 80000 == 0:current_secs = processed_frames / float(framerate)progress_pct = min((current_secs / audio_duration) * 100, 100)elapsed = time.time() - transcribe_startif current_secs > 0:eta_secs = int((elapsed / current_secs) * (audio_duration - current_secs))self.root.after(0, lambda p=progress_pct, e=eta_secs: self.update_progress("Transcribing", p, e))if recognizer.AcceptWaveform(data):res = json.loads(recognizer.Result())block, block_index = self.create_srt_block(res, block_index)if block:srt_blocks.append(block)res_final = json.loads(recognizer.FinalResult())block, block_index = self.create_srt_block(res_final, block_index)if block:
+
+srt_blocks.append(block)wf.close()if os.path.exists(audio_file):os.remove(audio_file)self.extracted_text = "".join(srt_blocks)self.root.after(0, self.update_ui_success)except Exception as e:log_path = self.log_crash_report(e)error_summary = f"{type(e).name}: {str(e)}"self.root.after(0, lambda err=error_summary, path=log_path: self.update_ui_error(err, path))def create_srt_block(self, res_json: dict, current_idx: int) -> tuple:
+"""Parses word metadata maps sequentially into an explicit, standard SRT track block layout."""
+if "result" not in res_json or not res_json["result"]:return "", current_idxwords_data = res_json["result"]start_time = words_data[0]["start"]end_time = words_data[-1]["end"]start_srt = self.format_srt_timestamp(start_time)end_srt = self.format_srt_timestamp(end_time)phrase = " ".join([w["word"] for w in words_data])# Generate a standard valid SRT syntax block layoutsrt_block = f"{current_idx}\n{start_srt} --> {end_srt}\n{phrase}\n\n"return srt_block, current_idx + 1def update_progress(self, stage: str, percentage: float, eta_seconds: int):
+
+"""Thread-safe UI callback updating layout metrics."""self.progress_bar["value"] = percentageeta_str = str(datetime.timedelta(seconds=eta_seconds)) if eta_seconds > 0 else "0:00:00"# Split microseconds if presenteta_str = eta_str.split(".")[0]self.status_label.config(text=f"Status: {stage} ({int(percentage)}%)")self.eta_label.config(text=f"ETA: {eta_str}")def log_crash_report(self, exception: Exception) -> str:"""Generates a historical diagnostic log file upon structural framework crash alerts."""import tracebacklog_file_path = Path(file).parent / "crash_report.log"timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")log_content = ["=" * 60, f"CRASH REPORT: {timestamp}", "=" * 60,f"Target Video Path: {self.video_path}",traceback.format_exc(), "=" * 60, "\n"
+
+]with open(log_file_path, "a", encoding="utf-8") as f:f.write("\n".join(log_content))return str(log_file_path.resolve())def export_to_srt(self):"""Saves text explicitly using standard file selectors."""if not self.extracted_text:returninitial_file = f"{self.cleanPath().stem}.srt"save_path = filedialog.asksaveasfilename(defaultextension=".srt",filetypes=[("SubRip Subtitle Files", ".srt"), ("All Files", ".*")],initialfile=initial_file,)
+
+if save_path:with open(save_path, "w", encoding="utf-8") as f:f.write(self.extracted_text)messagebox.showinfo("Export Successful", "SRT file saved successfully!")def update_ui_success(self):self.progress_bar["value"] = 100self.eta_label.config(text="ETA: Finished")self.text_area.insert("1.0", self.extracted_text)self.status_label.config(text="Status: Completed!")self.process_btn.config(state="normal")self.export_btn.config(state="normal")messagebox.showinfo("Success", "SRT Subtitle Generation Complete!")def update_ui_error(self, error_msg: str, log_path: str):self.status_label.config(text="Status: Failed.")self.process_btn.config(state="normal")self.export_btn.config(state="disabled")self.eta_label.config(text="ETA: Error")
+
+error_win = tk.Toplevel(self.root)error_win.title("Execution Error")error_win.geometry("450x200")error_win.transient(self.root)error_win.grab_set()main_frame = ttk.Frame(error_win, padding=15)main_frame.pack(fill="both", expand=True)ttk.Label(main_frame, text=f"Pipeline error encountered:\n\n{error_msg}", wraplength=400, justify="left").pack(fill="x", expand=True)btn_frame = ttk.Frame(main_frame)btn_frame.pack(fill="x", side="bottom")def open_log():if os.name == "nt":os.startfile(log_path)else:opener = "open" if sys.platform == "darwin" else "xdg-open"subprocess.run([opener, log_path])
+
+ttk.Button(btn_frame, text="Open Log File", command=open_log).pack(side="left", padx=5)ttk.Button(btn_frame, text="OK", command=error_win.destroy).pack(side="right", padx=5)if name == "main":app_root = tk.Tk()app = DynamicSubprocessTranscriber(app_root)app_root.mainloop()
+
+
